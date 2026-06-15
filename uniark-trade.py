@@ -360,39 +360,21 @@ def api_klines():
     if not symbol:
         return jsonify({"ok": False, "error": "missing symbol"}), 400
     try:
-        candles = cached_klines(symbol, interval, limit, market)
+        candles = fetch_klines(symbol, interval, limit, market)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
-
-    # —— 结果记忆：底层 K 线没变 → 复用上次算好的 MACD/背离/高级别，跳过重算 ——
-    htf_choice = request.args.get("htf", "auto")
-    if candles:
-        last = candles[-1]
-        sig = (len(candles), last["time"], last["close"], last["high"], last["low"])
-    else:
-        sig = (0,)
-    memo_key = (market, symbol, interval, htf_choice)
-    hit = _COMPUTE_MEMO.get(memo_key)
-    if hit and hit[0] == sig:
-        return jsonify(hit[1])                     # 命中：直接返回，省掉全部重算
-
     macd, markers = compute_macd_and_divergences(candles)
     # 高级别(参考)周期叠加：解析(梯子/显式/关) + 拉取 + 投影 全部交给 htf_overlay 库。
-    # 取数回调注入带缓存的 cached_klines，并锁定同一 market(自选→现货 / Alpha→盘口)。
-    # 高级别周期同样走缓存：自选的高级别由采集线程常驻预热，故叠加也秒出。
-    htf_fetch = lambda s, iv, lim: cached_klines(s, iv, lim, market)
+    # 取数回调注入本模块的 fetch_klines，并锁定同一 market(自选→现货 / Alpha→盘口)。
+    htf_fetch = lambda s, iv, lim: fetch_klines(s, iv, lim, market)
     htf = (htfmod.fetch_and_project(
                symbol, [c["time"] for c in candles], interval, htf_fetch,
-               choice=htf_choice,
+               choice=request.args.get("htf", "auto"),
                min_macd_bars=MIN_BARS_FOR_MACD, div_min_bars=DIV_MIN_BARS,
                div_ratio_threshold=DIV_RATIO_THRESHOLD, div_max_level=DIV_MAX_LEVEL)
            if DIVERGENCE_OK else None)
-    payload = {"ok": True, "candles": candles, "macd": macd,
-               "divergences": markers, "htf": htf, "divOk": DIVERGENCE_OK}
-    if len(_COMPUTE_MEMO) >= _COMPUTE_MEMO_CAP:
-        _COMPUTE_MEMO.clear()                      # 简单封顶，防无界增长
-    _COMPUTE_MEMO[memo_key] = (sig, payload)
-    return jsonify(payload)
+    return jsonify({"ok": True, "candles": candles, "macd": macd,
+                    "divergences": markers, "htf": htf, "divOk": DIVERGENCE_OK})
 
 
 @app.route("/api/watchlist")
@@ -1274,7 +1256,5 @@ if __name__ == "__main__":
     print("uniark-trade 短线王 已启动：")
     print(f"  本机访问    ->  http://127.0.0.1:{port}")
     print(f"  局域网访问  ->  http://{lan_ip}:{port}   (手机/其他电脑用这个)")
-    # 后台采集守护线程：常驻预热自选现货进本地缓存库，网页只读库 → 出图秒开。
-    start_collector()
     # host=0.0.0.0 监听所有网卡（局域网可访问）。只读无密钥，家用网络无妨；勿映射公网。
     app.run(host="0.0.0.0", port=port, debug=False)
