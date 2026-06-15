@@ -30,7 +30,7 @@
 cd ~                              # 或者 cd ~/projects/
 
 # 下载源代码
-git clone https://github.com/uniark-pro/alpha-4x.git uniark-trade
+git clone https://github.com/uniark-pro/unairk-trade.git uniark-trade
 
 # 创建虚拟环境
 python3 -m venv venv
