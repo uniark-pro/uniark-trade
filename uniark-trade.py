@@ -41,16 +41,6 @@ except Exception as _e:                       # noqa: BLE001
     DIVERGENCE_OK = False
     _DIV_ERR = str(_e)
 
-# ---- 本地 K 线缓存层（storage.py，需与本文件同目录）----
-# 缺失 → 静默降级：cached_klines 退回直连币安（即原行为，无缓存加速）。
-try:
-    import storage
-    CACHE_OK = True
-    _CACHE_ERR = ""
-except Exception as _e:                       # noqa: BLE001
-    CACHE_OK = False
-    _CACHE_ERR = str(_e)
-
 BASE = "https://www.binance.com"
 TOKEN_LIST_URL = f"{BASE}/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
 KLINES_URL     = f"{BASE}/bapi/defi/v1/public/alpha-trade/klines"
@@ -250,99 +240,6 @@ def fetch_watchlist():
     return rows
 
 
-# ----------------------------- 本地缓存 / 后台采集 -----------------------------
-# 把"每次请求实时拉币安"换成"后台常驻采集进本地库、网页只读库"，从根上消除出图延迟。
-# 自选 5 现货由采集线程常驻刷新；Alpha 走"按需缓存"（首开补拉一次，之后读缓存）。
-# 指标仍在缓存到的 K 线上现算，divergence / indicator / htf_overlay 一行不动。
-CACHE_INTERVALS   = ["1m", "5m", "15m", "1h", "4h", "1d"]   # 每个流缓存这些周期
-CACHE_FETCH_LIMIT = 1000   # 每流缓存深度：覆盖主图(≤500) + 高级别投影所需(≤~300)，单请求上限内
-
-
-def _iv_seconds(iv):
-    """'1m' / '4h' / '1d' → 秒。"""
-    return int(iv[:-1]) * {"m": 60, "h": 3600, "d": 86400}[iv[-1]]
-
-
-# 自选现货常驻采集间隔（秒）：低周期勤刷、高周期懒刷
-COLLECT_CADENCE = {"1m": 30, "5m": 60, "15m": 120, "1h": 300, "4h": 600, "1d": 1800}
-
-# 读路径"新鲜"阈值（秒）：最新一根 open_time 比这更旧才触发实时补拉。
-# 取值 > 周期本身 + 采集间隔 + 余量，保证常驻采集的自选永远命中缓存、不冗余打网；
-# 对按需的 Alpha，过期时阻塞补拉一次（前端 30s 自动轮询会很快把它刷新）。
-STALENESS = {iv: _iv_seconds(iv) + COLLECT_CADENCE[iv] + 60 for iv in CACHE_INTERVALS}
-
-
-def cached_klines(symbol, interval, limit, market="alpha"):
-    """
-    带本地缓存的取数：先读 SQLite，命中且新鲜 → 直接返回（零网络往返）；
-    未命中 / 过期 → 实时补拉一次、写库、再读返回。实时失败时回退旧缓存（优雅降级）。
-    无 storage.py（CACHE_OK=False）→ 直连币安（即原行为）。
-    """
-    if not CACHE_OK:
-        return fetch_klines(symbol, interval, limit, market)
-    try:
-        cached = storage.query(market, symbol, interval, limit)
-    except Exception:                                       # noqa: BLE001
-        return fetch_klines(symbol, interval, limit, market)
-    if cached:
-        age = time.time() - cached[-1]["time"]
-        if age < STALENESS.get(interval, _iv_seconds(interval) + 60):
-            return cached                                   # 命中且新鲜：秒返
-    try:
-        live = fetch_klines(symbol, interval, CACHE_FETCH_LIMIT, market)
-    except Exception:                                       # noqa: BLE001
-        return cached                                       # 实时失败：回退旧缓存
-    if live:
-        try:
-            storage.upsert(market, symbol, interval, live)
-            return storage.query(market, symbol, interval, limit)
-        except Exception:                                   # noqa: BLE001
-            return live[-limit:]                            # 写库失败也别耽误出图
-    return cached
-
-
-def _safe_refresh_stream(market, symbol, interval):
-    """采集单条流：拉 CACHE_FETCH_LIMIT 根并 upsert。异常吞掉返回 0。"""
-    try:
-        live = fetch_klines(symbol, interval, CACHE_FETCH_LIMIT, market)
-        return storage.upsert(market, symbol, interval, live) if live else 0
-    except Exception:                                       # noqa: BLE001
-        return 0
-
-
-def _collector_loop():
-    """后台守护线程：常驻刷新自选 5 现货 × 6 周期（增量 upsert）。Alpha 不在此列（按需缓存）。"""
-    try:
-        storage.init_db()
-    except Exception as e:                                  # noqa: BLE001
-        print(f"[采集] 初始化缓存库失败，放弃后台采集：{e}", flush=True)
-        return
-    pairs = [(s + "USDT", iv) for s in WATCHLIST for iv in CACHE_INTERVALS]
-    # 冷启动预热：并发拉一遍，网页一上来自选就是热的
-    with ThreadPoolExecutor(max_workers=TURNOVER_WORKERS) as ex:
-        list(ex.map(lambda p: _safe_refresh_stream("spot", p[0], p[1]), pairs))
-    print(f"[采集] 预热完成：自选 {len(pairs)} 条流已入库"
-          f"（{len(WATCHLIST)} 币 × {len(CACHE_INTERVALS)} 周期）", flush=True)
-    next_due = {p: time.time() + COLLECT_CADENCE[p[1]] for p in pairs}
-    while True:
-        now = time.time()
-        for p in pairs:
-            if now >= next_due[p]:
-                _safe_refresh_stream("spot", p[0], p[1])
-                next_due[p] = time.time() + COLLECT_CADENCE[p[1]]
-        time.sleep(5)
-
-
-def start_collector():
-    """启动后台采集守护线程（仅当缓存层可用）。"""
-    if not CACHE_OK:
-        print(f"[采集] 未加载缓存层（{_CACHE_ERR}）—— 看板照常运行，但无缓存加速（仍每次实时拉）。",
-              flush=True)
-        return
-    import threading
-    threading.Thread(target=_collector_loop, name="kline-collector", daemon=True).start()
-
-
 # ----------------------------- MACD + 背离 -----------------------------
 def compute_macd_and_divergences(candles):
     """
@@ -466,6 +363,19 @@ def api_klines():
         candles = cached_klines(symbol, interval, limit, market)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
+
+    # —— 结果记忆：底层 K 线没变 → 复用上次算好的 MACD/背离/高级别，跳过重算 ——
+    htf_choice = request.args.get("htf", "auto")
+    if candles:
+        last = candles[-1]
+        sig = (len(candles), last["time"], last["close"], last["high"], last["low"])
+    else:
+        sig = (0,)
+    memo_key = (market, symbol, interval, htf_choice)
+    hit = _COMPUTE_MEMO.get(memo_key)
+    if hit and hit[0] == sig:
+        return jsonify(hit[1])                     # 命中：直接返回，省掉全部重算
+
     macd, markers = compute_macd_and_divergences(candles)
     # 高级别(参考)周期叠加：解析(梯子/显式/关) + 拉取 + 投影 全部交给 htf_overlay 库。
     # 取数回调注入带缓存的 cached_klines，并锁定同一 market(自选→现货 / Alpha→盘口)。
@@ -473,12 +383,16 @@ def api_klines():
     htf_fetch = lambda s, iv, lim: cached_klines(s, iv, lim, market)
     htf = (htfmod.fetch_and_project(
                symbol, [c["time"] for c in candles], interval, htf_fetch,
-               choice=request.args.get("htf", "auto"),
+               choice=htf_choice,
                min_macd_bars=MIN_BARS_FOR_MACD, div_min_bars=DIV_MIN_BARS,
                div_ratio_threshold=DIV_RATIO_THRESHOLD, div_max_level=DIV_MAX_LEVEL)
            if DIVERGENCE_OK else None)
-    return jsonify({"ok": True, "candles": candles, "macd": macd,
-                    "divergences": markers, "htf": htf, "divOk": DIVERGENCE_OK})
+    payload = {"ok": True, "candles": candles, "macd": macd,
+               "divergences": markers, "htf": htf, "divOk": DIVERGENCE_OK}
+    if len(_COMPUTE_MEMO) >= _COMPUTE_MEMO_CAP:
+        _COMPUTE_MEMO.clear()                      # 简单封顶，防无界增长
+    _COMPUTE_MEMO[memo_key] = (sig, payload)
+    return jsonify(payload)
 
 
 @app.route("/api/watchlist")
