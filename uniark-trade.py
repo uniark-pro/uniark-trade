@@ -22,7 +22,6 @@ uniark-trade 短线王 + MACD 背离（只读，无需 API Key，不涉及任何
 
 import time
 import json
-import bisect
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request, Response
