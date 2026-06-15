@@ -30,7 +30,7 @@
 cd ~                              # 或者 cd ~/projects/
 
 # 下载源代码
-git clone https://github.com/uniark-pro/uniark-trade.git uniark-trade
+git clone https://github.com/uniark-pro/alpha-4x.git uniark-trade
 
 # 创建虚拟环境
 python3 -m venv venv
@@ -47,13 +47,16 @@ pip install flask requests pandas numpy
 ### 文件清单（须同目录）
 
 ```
-uniark-trade.py   # 看板本体（Flask 服务 + 前端）
+uniark-trade.py   # 看板本体（Flask 服务 + 前端 + 后台采集线程）
 indicator.py           # 复用：EMA / MACD
 divergence.py          # 复用：背离检测
 htf_overlay.py         # 复用：高级别 MACD 投影 + 顺势过滤
+storage.py             # 本地 K 线缓存层（SQLite），看板秒开的关键
 ```
 
 > 看板背离阈值（`MISSED_EXTREME_MIN_BARS`）内置在 `divergence.py`，高级别梯子等内置在 `htf_overlay.py`，看板按默认值调用。
+>
+> 运行后会自动生成 `data/kline_cache.db`（SQLite 缓存）。可随时删除，重启会重建。
 
 ### 启动
 
@@ -77,6 +80,33 @@ python uniark-trade.py 5001     # 指定端口
 ```
 
 此时看板**照常显示 K 线，但没有 MACD、背离和高级别叠加**。补齐文件 + 装好依赖即可（也可看 `/api/klines` 返回里的 `divOk` 字段确认）。
+
+如果 `storage.py` 缺失，启动时打印 `[采集] 未加载缓存层 …`，看板仍正常运行，只是退回"每次实时拉币安"（无缓存加速）。补上 `storage.py` 即可。
+
+---
+
+## 本地缓存 / 秒开（消除出图延迟）
+
+为根除"每次点图都要去币安拉一趟"的延迟，看板内置了一层**本地 SQLite 缓存 + 后台采集线程**：
+
+- **读写分离**：`/api/klines` 不再每次打币安——先读本地库 `data/kline_cache.db`，**命中即零网络往返**（亚毫秒级出图）；未命中/过期才回退实时拉一次并写库。高级别叠加的取数同样走缓存。
+- **后台采集线程**：随看板启动的守护线程，常驻把**自选 5 个现货 × 6 个周期**增量刷进缓存（低周期勤刷、高周期懒刷，见下表），所以默认进入的自选页**永远是热的**。
+- **Alpha 按需缓存**：×4 代币不常驻采集（省请求、避免 bapi 限频）。某 Alpha 币**首次打开**补拉一次（那一次稍慢），之后读缓存；过期后下次访问再补拉一次。
+- **指标仍现算**：缓存只存 K 线；MACD / 背离 / 高级别投影仍在缓存到的 K 线上现算（几百根上现算只要毫秒），所以 `indicator.py` / `divergence.py` / `htf_overlay.py` 一行未改。
+- **零新依赖**：`sqlite3` 是 Python 标准库，依赖清单不变。
+
+| 周期 | 自选常驻采集间隔 | 读路径"过期"阈值 |
+|------|------------------|------------------|
+| 1m | 30s | 150s |
+| 5m | 60s | 420s |
+| 15m | 120s | 1080s |
+| 1h | 300s | 3960s |
+| 4h | 600s | 15060s |
+| 1d | 1800s | 88260s |
+
+> **新鲜度取舍**：阈值取"周期 + 采集间隔 + 余量"，保证常驻的自选永远命中缓存、不冗余打网。代价是按需的 Alpha 在过期窗口内最多落后约一根 K 线——前端每 30s 自动轮询会很快把它补上，手动刷新亦可。想让 Alpha 也常驻或更激进刷新，调 `uniark-trade.py` 里的采集范围 / `STALENESS` 即可。
+>
+> 首次启动会预热自选（并发拉一遍），终端打印 `[采集] 预热完成：自选 N 条流已入库`。调试可看 `storage.stats()` 或直接查 `data/kline_cache.db`。
 
 ---
 
@@ -206,6 +236,9 @@ python uniark-trade.py 5001     # 指定端口
 | 高级别默认梯子 | `htf_overlay.py` | `HTF_LADDER` | 紧邻上一档 |
 | 高级别拉取根数 | `htf_overlay.py` | `DEFAULT_FETCH_LIMIT` | `300` |
 | L0 极值过短过滤 | `divergence.py` | `MISSED_EXTREME_MIN_BARS` | `9` |
+| 自选常驻采集间隔 | `uniark-trade.py` | `COLLECT_CADENCE` | 见缓存章节 |
+| 缓存"过期"阈值 | `uniark-trade.py` | `STALENESS` | 见缓存章节 |
+| 每流缓存深度 | `uniark-trade.py` | `CACHE_FETCH_LIMIT` | `1000` |
 
 > **箭头太密**：把 `DIV_MAX_LEVEL` 改成 `2`（只看 L1/L2），或调大 `DIV_MIN_BARS`。只影响**本级别**密度，不影响高级别叠加。
 
@@ -220,6 +253,8 @@ python uniark-trade.py 5001     # 指定端口
 | 1d 周期下拉灰掉 | 正常，1d 之上无更高周期可投影 |
 | 手机连不上 | 用启动打印的**局域网地址**，且与电脑同一 Wi-Fi |
 | 想看某币原始盘口 | 浏览器开 `/api/ticker?symbol=ALPHA_162USDT` 看 ticker JSON |
+| 自选出图秒开、Alpha 首开略慢 | 正常：自选常驻采集已预热，Alpha 是按需缓存（首开补拉一次，之后秒开） |
+| 缓存想清空重建 | 停服删掉 `data/kline_cache.db` 再启动即可；启动日志 `[采集] 未加载缓存层` 则是 `storage.py` 缺失 |
 
 ---
 
