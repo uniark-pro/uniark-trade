@@ -51,7 +51,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 SPOT_BASE       = "https://api.binance.com"
 SPOT_KLINES_URL = f"{SPOT_BASE}/api/v3/klines"
 SPOT_TICKER_URL = f"{SPOT_BASE}/api/v3/ticker/24hr"
-WATCHLIST       = ["BTC", "ETH", "BNB", "SOL", "DOGE"]   # 自选：主流现货 USDT 交易对(固定顺序)
+WATCHLIST       = ["BTC", "ETH", "BNB", "SOL", "DOGE", "HYPE", "UNI", "ZEC"]   # 自选：主流现货 USDT 交易对(固定顺序)
 
 BONUS_WINDOW_DAYS = 30        # 官方规则：空投/TGE 后 30 天内享加成
 
