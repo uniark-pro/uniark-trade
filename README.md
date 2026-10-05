@@ -27,10 +27,10 @@
 ## 安装
 
 ```bash
-cd ~                              # 或者 cd ~/projects/
+cd ~
 
 # 下载源代码
-git clone https://github.com/uniark-pro/uniark-trade.git uniark-trade
+git clone https://github.com/uniark-pro/uniark-trade.git uniark-trade && cd uniark-trade
 
 # 创建虚拟环境
 python3 -m venv venv
@@ -41,7 +41,6 @@ source venv/bin/activate
 # 安装依赖
 pip install --upgrade pip
 pip install flask requests pandas numpy
-
 ```
 
 ### 文件清单（须同目录）
